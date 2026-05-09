@@ -22,8 +22,18 @@ struct AppState {
 
 type SharedState = Arc<AppState>;
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(4)
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
+    pin_to_first_core();
+
     let index_path = std::env::var("INDEX_PATH")
         .unwrap_or_else(|_| "/app/ivf_index.bin".into());
 
@@ -31,13 +41,11 @@ async fn main() -> anyhow::Result<()> {
     let index = IvfIndex::load(&index_path)?;
     eprintln!("Índice carregado: {} vetores, {} clusters", index.n, index.k);
 
-    // nprobe lido uma única vez no startup — sem overhead por request
     let nprobe = std::env::var("NPROBE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(index.nprobe_default);
 
-    // Warm-up: popula caches e valida path de código antes de aceitar requests
     let dummy = [0.5f32; 16];
     let _ = index.search(&dummy, nprobe);
 
@@ -57,6 +65,17 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn pin_to_first_core() {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(ids) = core_affinity::get_core_ids() {
+            if let Some(id) = ids.into_iter().next() {
+                let _ = core_affinity::set_for_current(id);
+            }
+        }
+    }
+}
+
 async fn ready_handler() -> impl IntoResponse {
     StatusCode::OK
 }
@@ -66,7 +85,12 @@ async fn fraud_score_handler(
     Json(req): Json<FraudRequest>,
 ) -> impl IntoResponse {
     let query = vectorize::vectorize(&req);
-    let fraud_score = state.index.search(&query, state.nprobe);
+
+    let fraud_score = tokio::task::spawn_blocking(move || {
+        state.index.search(&query, state.nprobe)
+    })
+    .await
+    .unwrap();
 
     Json(FraudResponse {
         approved: fraud_score < 0.6,

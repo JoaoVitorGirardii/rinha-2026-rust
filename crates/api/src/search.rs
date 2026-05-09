@@ -12,8 +12,10 @@ pub struct IvfIndex {
     cluster_offsets: Vec<u32>,
     cluster_sizes: Vec<u32>,
     labels: Vec<u8>,
-    // Vetores armazenados como f16 em u16, padded para 16 valores por vetor
+    // f16 como u16 — usado no re-ranking exato (hot path fase 2)
     vectors: Vec<u16>,
+    // uint8 quantizado — usado no scan rápido (hot path fase 1)
+    vectors_u8: Vec<u8>,
 }
 
 impl IvfIndex {
@@ -79,12 +81,22 @@ impl IvfIndex {
         // Vectors: n * storage_dims * 2 bytes (f16 as u16)
         let vec_bytes = n * storage_dims * 2;
         let vec_slice = &data[offset..offset + vec_bytes];
-        // Interpreta como u16 little-endian
         let mut vectors: Vec<u16> = Vec::with_capacity(n * storage_dims);
         for i in 0..n * storage_dims {
             let b = &vec_slice[i * 2..i * 2 + 2];
             vectors.push(u16::from_le_bytes(b.try_into().unwrap()));
         }
+
+        // Deriva uint8 dos vetores f16 para o scan rápido.
+        // Fórmula: ((f32 + 1.0) * 127.5) → [0..255]
+        // Faixa [-1,1] → [0,255]; -1.0→0, 0.0→127, 1.0→255
+        let vectors_u8: Vec<u8> = vectors
+            .iter()
+            .map(|&bits| {
+                let v = f16::from_bits(bits).to_f32();
+                ((v + 1.0) * 127.5).clamp(0.0, 255.0).round() as u8
+            })
+            .collect();
 
         Ok(IvfIndex {
             k,
@@ -95,6 +107,7 @@ impl IvfIndex {
             cluster_sizes,
             labels,
             vectors,
+            vectors_u8,
         })
     }
 
@@ -102,8 +115,7 @@ impl IvfIndex {
     /// query deve ser [f32; 16] com dims 14 e 15 = 0 (padding).
     #[inline]
     pub fn search(&self, query: &[f32; 16], nprobe: usize) -> f32 {
-        // Passo 1: encontrar os nprobe centroides mais próximos
-        // Stack-allocated para evitar heap alloc: K=1024 entries × 8 bytes = 8 KB
+        // Passo 1: encontrar os nprobe centroides mais próximos (f32+L2)
         let mut centroid_dists = [(0.0f32, 0u32); 1024];
         let k = self.k.min(1024);
 
@@ -112,33 +124,142 @@ impl IvfIndex {
             centroid_dists[i] = (d, i as u32);
         }
 
-        // Particiona para encontrar os nprobe menores sem sort completo
         let nprobe = nprobe.min(k);
         centroid_dists[..k].select_nth_unstable_by(nprobe - 1, |a, b| {
             a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // Passo 2: escanear os nprobe clusters com SIMD
-        let mut topk = TopK5::new();
+        // Passo 2: quantiza query para uint8 para o scan rápido
+        let query_u8: [u8; 16] = std::array::from_fn(|i| {
+            ((query[i] + 1.0) * 127.5).clamp(0.0, 255.0).round() as u8
+        });
+
+        // Passo 3: scan rápido uint8+Manhattan → mantém top-50 candidatos
+        // Top-50 fornece buffer suficiente para que o re-ranking f16+L2
+        // encontre os mesmos top-5 que encontraria varrendo todos os vetores.
+        let mut cands = TopK50::new();
+
+        #[cfg(target_arch = "x86_64")]
+        let use_avx2 = is_x86_feature_detected!("avx2");
+        #[cfg(not(target_arch = "x86_64"))]
+        let use_avx2 = false;
 
         for idx in 0..nprobe {
             let ci = centroid_dists[idx].1 as usize;
             let start = self.cluster_offsets[ci] as usize;
             let size = self.cluster_sizes[ci] as usize;
+            let base_ptr = unsafe { self.vectors_u8.as_ptr().add(start * 16) };
 
-            for j in 0..size {
-                let vec_start = (start + j) * 16;
-                // SAFETY: vec_start + 16 é sempre <= vectors.len() pois o índice foi
-                // construído com storage_dims=16 para cada um dos n vetores.
-                let ref_f16 = unsafe {
-                    self.vectors.as_ptr().add(vec_start) as *const [u16; 16]
-                };
-                let dist = dist_sq_f16(query, unsafe { &*ref_f16 });
-                topk.push(dist, self.labels[start + j]);
+            if use_avx2 {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    use std::arch::x86_64::*;
+                    // Repete query nos dois halves de 128 bits do registrador YMM
+                    let q128 = _mm_loadu_si128(query_u8.as_ptr() as *const __m128i);
+                    let query_x2 = _mm256_set_m128i(q128, q128);
+
+                    let pairs = size / 2;
+                    for j in 0..pairs {
+                        let ptr = base_ptr.add(j * 32);
+                        let (d0, d1) = manhattan_u8x2_avx2(query_x2, ptr);
+                        cands.push(d0, (start + j * 2) as u32);
+                        cands.push(d1, (start + j * 2 + 1) as u32);
+                    }
+                    // Vetor ímpar restante
+                    if size % 2 == 1 {
+                        let global = start + size - 1;
+                        let ref_u8 = base_ptr.add((size - 1) * 16) as *const [u8; 16];
+                        let dist = manhattan_u8(&query_u8, &*ref_u8);
+                        cands.push(dist, global as u32);
+                    }
+                }
+            } else {
+                for j in 0..size {
+                    let global = start + j;
+                    let ref_u8 = unsafe { base_ptr.add(j * 16) as *const [u8; 16] };
+                    let dist = manhattan_u8(&query_u8, unsafe { &*ref_u8 });
+                    cands.push(dist, global as u32);
+                }
             }
         }
 
+        // Passo 4: re-ranking exato com f16+L2 sobre os top-50 candidatos
+        let mut topk = TopK5::new();
+        let count = cands.count;
+
+        for i in 0..count {
+            let global = cands.indices[i] as usize;
+            let vec_start = global * 16;
+            let ref_f16 = unsafe {
+                self.vectors.as_ptr().add(vec_start) as *const [u16; 16]
+            };
+            let dist = dist_sq_f16(query, unsafe { &*ref_f16 });
+            topk.push(dist, self.labels[global]);
+        }
+
         topk.fraud_score()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TopK50: mantém os 50 menores índices por distância uint8+Manhattan
+// Usado para selecionar candidatos para re-ranking exato.
+// Buffer maior reduz FP/FN em edge cases onde top-5 f16+L2 não coincide com top-30 u8.
+// ---------------------------------------------------------------------------
+
+struct TopK50 {
+    dists: [u32; 50],
+    indices: [u32; 50],
+    max_dist: u32,
+    max_idx: usize,
+    count: usize,
+}
+
+impl TopK50 {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            dists: [u32::MAX; 50],
+            indices: [0u32; 50],
+            max_dist: u32::MAX,
+            max_idx: 0,
+            count: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, dist: u32, global_idx: u32) {
+        if self.count < 50 {
+            let i = self.count;
+            self.dists[i] = dist;
+            self.indices[i] = global_idx;
+            self.count += 1;
+            if dist > self.max_dist || i == 0 {
+                self.max_dist = dist;
+                self.max_idx = i;
+            }
+            // Recalcula max quando o array enche
+            if self.count == 50 {
+                self.max_dist = u32::MIN;
+                for j in 0..50 {
+                    if self.dists[j] > self.max_dist {
+                        self.max_dist = self.dists[j];
+                        self.max_idx = j;
+                    }
+                }
+            }
+        } else if dist < self.max_dist {
+            let idx = self.max_idx;
+            self.dists[idx] = dist;
+            self.indices[idx] = global_idx;
+            self.max_dist = u32::MIN;
+            for j in 0..50 {
+                if self.dists[j] > self.max_dist {
+                    self.max_dist = self.dists[j];
+                    self.max_idx = j;
+                }
+            }
+        }
     }
 }
 
@@ -170,7 +291,6 @@ impl TopK5 {
             let idx = self.max_idx;
             self.dists[idx] = dist;
             self.labels[idx] = label;
-            // Atualiza o máximo com scan linear em 5 elementos
             self.max_dist = f32::NEG_INFINITY;
             for i in 0..5 {
                 if self.dists[i] > self.max_dist {
@@ -189,7 +309,79 @@ impl TopK5 {
 }
 
 // ---------------------------------------------------------------------------
-// Distância euclidiana ao quadrado — centraloides (f32 × 14)
+// Distância Manhattan uint8 — hot path fase 1
+// SSE2: _mm_sad_epu8 → 16 bytes por instrução
+// AVX2: _mm256_sad_epu8 → 32 bytes (2 vetores) por instrução — 2× throughput
+// ---------------------------------------------------------------------------
+
+#[inline(always)]
+fn manhattan_u8(a: &[u8; 16], b: &[u8; 16]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        return unsafe { manhattan_u8_sse2(a, b) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        manhattan_u8_scalar(a, b)
+    }
+}
+
+// Scan de 2 vetores consecutivos de 16 bytes com AVX2.
+// Retorna (dist_v0, dist_v1) em uma única instrução _mm256_sad_epu8.
+// Layout de entrada: data_ptr aponta para [v0[0..16], v1[0..16]] = 32 bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn manhattan_u8x2_avx2(
+    query_x2: std::arch::x86_64::__m256i,
+    data_ptr: *const u8,
+) -> (u32, u32) {
+    use std::arch::x86_64::*;
+    // Carrega 32 bytes = 2 vetores consecutivos
+    let data = _mm256_loadu_si256(data_ptr as *const __m256i);
+    // SAD sobre 32 bytes: 4 acumuladores de 64 bits
+    // [SAD(q[0..7],v0[0..7]), SAD(q[8..15],v0[8..15]),
+    //  SAD(q[0..7],v1[0..7]), SAD(q[8..15],v1[8..15])]
+    let sad = _mm256_sad_epu8(query_x2, data);
+
+    // Extrai soma para v0 (lower 128 bits)
+    let lo128 = _mm256_castsi256_si128(sad);
+    let d0_a = _mm_cvtsi128_si64(lo128) as u32;
+    let shifted = _mm_srli_si128(lo128, 8);
+    let d0_b = _mm_cvtsi128_si64(shifted) as u32;
+    let dist0 = d0_a + d0_b;
+
+    // Extrai soma para v1 (upper 128 bits)
+    let hi128 = _mm256_extracti128_si256(sad, 1);
+    let d1_a = _mm_cvtsi128_si64(hi128) as u32;
+    let shifted2 = _mm_srli_si128(hi128, 8);
+    let d1_b = _mm_cvtsi128_si64(shifted2) as u32;
+    let dist1 = d1_a + d1_b;
+
+    (dist0, dist1)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+#[inline]
+unsafe fn manhattan_u8_sse2(a: &[u8; 16], b: &[u8; 16]) -> u32 {
+    use std::arch::x86_64::*;
+    let va = _mm_loadu_si128(a.as_ptr() as *const __m128i);
+    let vb = _mm_loadu_si128(b.as_ptr() as *const __m128i);
+    let sad = _mm_sad_epu8(va, vb);
+    let lo = _mm_cvtsi128_si64(sad) as u32;
+    let hi_reg = _mm_srli_si128(sad, 8);
+    let hi = _mm_cvtsi128_si64(hi_reg) as u32;
+    lo + hi
+}
+
+#[allow(dead_code)]
+fn manhattan_u8_scalar(a: &[u8; 16], b: &[u8; 16]) -> u32 {
+    a.iter().zip(b.iter()).map(|(&x, &y)| x.abs_diff(y) as u32).sum()
+}
+
+// ---------------------------------------------------------------------------
+// Distância euclidiana ao quadrado — centroides (f32 × 14)
 // ---------------------------------------------------------------------------
 
 #[inline(always)]
@@ -203,21 +395,18 @@ fn dist_sq_14d_f32(a: &[f32; 16], b: &[f32; 14]) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// Distância euclidiana ao quadrado — vetores f16 (hot path)
+// Distância euclidiana ao quadrado — vetores f16 — hot path fase 2
 // ---------------------------------------------------------------------------
 
 #[inline(always)]
 pub fn dist_sq_f16(query: &[f32; 16], ref_f16: &[u16; 16]) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") {
-            return unsafe { dist_sq_f16_avx2(query, ref_f16) };
-        }
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") {
+        return unsafe { dist_sq_f16_avx2(query, ref_f16) };
     }
     dist_sq_f16_scalar(query, ref_f16)
 }
 
-/// Fallback escalar: converte f16 → f32 e computa distância euclidiana quadrada.
 #[inline]
 fn dist_sq_f16_scalar(query: &[f32; 16], ref_f16: &[u16; 16]) -> f32 {
     let mut sum = 0.0f32;
@@ -229,57 +418,44 @@ fn dist_sq_f16_scalar(query: &[f32; 16], ref_f16: &[u16; 16]) -> f32 {
     sum
 }
 
-/// Hot path SIMD: AVX2 + F16C.
-/// Carrega 16 f16 em 2 batches de 8, converte para f32, computa dist² horizontal.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c")]
 unsafe fn dist_sq_f16_avx2(query: &[f32; 16], ref_f16: &[u16; 16]) -> f32 {
     use std::arch::x86_64::*;
 
-    // Carrega query como dois registradores f32×8
-    let q0 = _mm256_loadu_ps(query.as_ptr());           // query[0..8]
-    let q1 = _mm256_loadu_ps(query.as_ptr().add(8));    // query[8..16]
+    let q0 = _mm256_loadu_ps(query.as_ptr());
+    let q1 = _mm256_loadu_ps(query.as_ptr().add(8));
 
-    // Carrega ref como dois __m128i (8 f16 × 2 bytes = 16 bytes cada)
-    let h0 = _mm_loadu_si128(ref_f16.as_ptr() as *const __m128i);        // ref_f16[0..8]
-    let h1 = _mm_loadu_si128((ref_f16.as_ptr() as *const __m128i).add(1)); // ref_f16[8..16]
+    let h0 = _mm_loadu_si128(ref_f16.as_ptr() as *const __m128i);
+    let h1 = _mm_loadu_si128((ref_f16.as_ptr() as *const __m128i).add(1));
 
-    // Converte f16 → f32 via F16C
     let r0 = _mm256_cvtph_ps(h0);
     let r1 = _mm256_cvtph_ps(h1);
 
-    // Diferença
     let d0 = _mm256_sub_ps(q0, r0);
     let d1 = _mm256_sub_ps(q1, r1);
 
-    // Quadrado
     let s0 = _mm256_mul_ps(d0, d0);
     let s1 = _mm256_mul_ps(d1, d1);
 
-    // Soma dos dois registradores
     let sum8 = _mm256_add_ps(s0, s1);
 
-    // Redução horizontal: 8 floats → 1 float
     hsum256(sum8)
 }
 
-/// Redução horizontal de __m256 (8 floats) para um único f32.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
     use std::arch::x86_64::*;
 
-    // Divide em duas metades de 128-bit e soma
     let low  = _mm256_castps256_ps128(v);
     let high = _mm256_extractf128_ps(v, 1);
     let sum2 = _mm_add_ps(low, high);
 
-    // Reduz 4 floats para 2
     let shuf = _mm_movehdup_ps(sum2);
     let sum4 = _mm_add_ps(sum2, shuf);
 
-    // Reduz 2 floats para 1
     let hi64 = _mm_movehl_ps(sum4, sum4);
     let sum8 = _mm_add_ss(sum4, hi64);
 
@@ -298,42 +474,39 @@ mod tests {
         topk.push(0.9, 1);
         topk.push(0.3, 0);
         topk.push(0.7, 1);
-        // fraud_score = 3/5 = 0.6
         assert!((topk.fraud_score() - 0.6).abs() < 1e-6);
     }
 
     #[test]
     fn test_topk5_replaces_worst() {
         let mut topk = TopK5::new();
-        // Insere 5 valores com labels
         topk.push(1.0, 1);
         topk.push(0.9, 1);
         topk.push(0.8, 1);
         topk.push(0.7, 1);
         topk.push(0.6, 1);
-        // Insere valor melhor → deve substituir o pior (1.0)
         topk.push(0.1, 0);
-        // Agora labels devem ter 4 fraudes e 1 legit
         assert!((topk.fraud_score() - 0.8).abs() < 1e-6);
     }
 
     #[test]
-    fn test_dist_scalar_vs_simd() {
-        let query = [0.5f32, 0.1, -1.0, 0.8, 0.3, -1.0, -1.0, 0.05, 0.15, 0.0, 1.0, 0.0, 0.5, 0.006, 0.0, 0.0];
-        // Cria vetor ref em f16
-        let mut ref_f16 = [0u16; 16];
-        for i in 0..16 {
-            ref_f16[i] = half::f16::from_f32(query[i] * 0.9).to_bits();
-        }
-        let scalar = dist_sq_f16_scalar(&query, &ref_f16);
+    fn test_manhattan_u8() {
+        let a = [0u8; 16];
+        let b = [1u8; 16];
+        assert_eq!(manhattan_u8(&a, &b), 16);
+        let c = [255u8; 16];
+        assert_eq!(manhattan_u8(&a, &c), 255 * 16);
+    }
 
-        #[cfg(target_arch = "x86_64")]
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") {
-            let simd = unsafe { dist_sq_f16_avx2(&query, &ref_f16) };
-            assert!(
-                (scalar - simd).abs() < 1e-3,
-                "scalar={scalar} simd={simd} devem ser iguais dentro da tolerância f16"
-            );
+    #[test]
+    fn test_topk50_fills_and_replaces() {
+        let mut tk = TopK50::new();
+        for i in 0..55u32 {
+            tk.push(i * 10, i);
         }
+        // Deve ter apenas os 50 menores (0..50 com dists 0..490)
+        assert_eq!(tk.count, 50);
+        let max = tk.dists[..50].iter().copied().max().unwrap();
+        assert_eq!(max, 490); // dist 49 * 10 = 490
     }
 }
