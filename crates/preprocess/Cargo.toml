@@ -14,5 +14,4 @@ flate2 = "1"
 half = "2"
 rayon = "1"
 rand = { version = "0.8", features = ["small_rng"] }
-bytemuck = { version = "1", features = ["derive"] }
 anyhow = "1"

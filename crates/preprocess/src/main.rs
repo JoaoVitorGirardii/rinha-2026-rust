@@ -35,8 +35,6 @@ fn load_references(path: &str) -> Result<(Vec<[f32; DIMS]>, Vec<u8>)> {
     let file = File::open(path).with_context(|| format!("abrindo {path}"))?;
     let gz = GzDecoder::new(BufReader::with_capacity(1 << 22, file));
 
-    // references.json.gz é um array JSON — carregamos tudo de uma vez.
-    // No stage de build não há restrição de memória (300-400 MB durante parse é OK).
     eprintln!("  Descomprimindo e parseando JSON...");
     let entries: Vec<ReferenceEntry> =
         serde_json::from_reader(gz).context("parse de references.json.gz")?;
@@ -80,7 +78,6 @@ fn kmeans_plus_plus(vectors: &[[f32; DIMS]], k: usize, seed: u64) -> Vec<[f32; D
     let mut min_dists: Vec<f32> = vec![f32::INFINITY; n];
 
     for c_idx in 1..k {
-        // Atualiza distâncias mínimas para o novo centroide adicionado
         let prev_c = &centroids[c_idx - 1];
         min_dists.par_iter_mut().zip(vectors.par_iter()).for_each(|(d, v)| {
             let dist = dist_sq_14d(v, prev_c);
@@ -89,7 +86,6 @@ fn kmeans_plus_plus(vectors: &[[f32; DIMS]], k: usize, seed: u64) -> Vec<[f32; D
             }
         });
 
-        // Amostragem proporcional a dist²
         let total: f64 = min_dists.iter().map(|&d| d as f64).sum();
         let threshold = rng.gen::<f64>() * total;
         let mut cumsum = 0.0f64;
@@ -127,13 +123,11 @@ fn run_kmeans(
     let mut assignments = vec![0u32; n];
 
     for iter in 0..iterations {
-        // Assign: cada vetor ao centroide mais próximo (paralelo)
         let new_assignments: Vec<u32> = vectors
             .par_iter()
             .map(|v| nearest_centroid(v, &centroids) as u32)
             .collect();
 
-        // Conta mudanças
         let changes: usize = assignments
             .iter()
             .zip(new_assignments.iter())
@@ -142,7 +136,6 @@ fn run_kmeans(
 
         assignments = new_assignments;
 
-        // Update: recalcula centroides como média dos pontos atribuídos
         let mut sums = vec![[0.0f64; DIMS]; k];
         let mut counts = vec![0u64; k];
 
@@ -157,7 +150,7 @@ fn run_kmeans(
         let mut max_delta = 0.0f32;
         for i in 0..k {
             if counts[i] == 0 {
-                continue; // centroide vazio, mantém o anterior
+                continue;
             }
             let mut new_c = [0.0f32; DIMS];
             for d in 0..DIMS {
@@ -212,8 +205,6 @@ fn write_index(
     w.write_all(&(DIMS as u32).to_le_bytes())?;                  // dims reais
     w.write_all(&(STORAGE_DIMS as u32).to_le_bytes())?;          // storage dims (padded)
     w.write_all(&(nprobe_default as u32).to_le_bytes())?;        // nprobe default
-    // Reserved: 28 bytes de zeros para preencher até 64 bytes
-    // (já temos 8+4+4+4+4+4+4 = 32 bytes, precisamos de 32 de reserved)
     w.write_all(&[0u8; 32])?;
 
     // Centroids: k * DIMS * 4 bytes
@@ -326,13 +317,12 @@ fn validate_recall(
             .collect();
         centroid_dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-        // TopK5 simples para validação
         let mut topk_dists = [f32::INFINITY; 5];
         let mut topk_labels = [0u8; 5];
         let mut max_d = f32::INFINITY;
         let mut max_i = 0usize;
 
-        for &(_, ci) in &centroid_dists[..nprobe] {
+        for &(_, ci) in &centroid_dists[..nprobe.min(k)] {
             let start = cluster_offsets[ci] as usize;
             let size = cluster_sizes[ci] as usize;
             for j in 0..size {
@@ -397,7 +387,6 @@ fn main() -> Result<()> {
 
     let (centroids, assignments) = run_kmeans(&vectors, k, iterations);
 
-    // Ordena vetores e labels por cluster
     eprintln!("Reorganizando vetores por cluster...");
     let mut cluster_indices: Vec<Vec<usize>> = vec![Vec::new(); k];
     for (i, &ci) in assignments.iter().enumerate() {
@@ -420,7 +409,6 @@ fn main() -> Result<()> {
         offset += cluster_sizes[ci];
     }
 
-    // Valida recall numa amostra de 1000 vetores antes de escrever
     eprintln!("Validando recall...");
     validate_recall(
         &vectors,
@@ -446,7 +434,6 @@ fn main() -> Result<()> {
         &cluster_sizes,
     )?;
 
-    // Mostra estatísticas de clusters
     let min_size = cluster_sizes.iter().min().copied().unwrap_or(0);
     let max_size = cluster_sizes.iter().max().copied().unwrap_or(0);
     let avg_size = n as f64 / k as f64;

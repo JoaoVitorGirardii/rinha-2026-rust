@@ -26,7 +26,7 @@ COPY crates/ ./crates/
 # Toca os arquivos para forçar recompilação
 RUN touch crates/api/src/main.rs crates/preprocess/src/main.rs
 
-# Flags de compilação para Haswell (suporte AVX2+F16C+FMA)
+# Flags de compilação para Haswell (AVX2+F16C+FMA)
 ENV RUSTFLAGS="-C target-cpu=haswell -C target-feature=+avx2,+f16c,+fma -C opt-level=3"
 
 RUN cargo build --release -p api -p preprocess
