@@ -39,10 +39,8 @@ async fn run() -> anyhow::Result<()> {
     let index = IvfIndex::load(&index_path)?;
     eprintln!("Índice carregado: {} vetores, {} clusters", index.n, index.k);
 
-    let nprobe = std::env::var("NPROBE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(7usize);
+    const NPROBE: usize = 8;
+    let nprobe = NPROBE;
 
     let topk = std::env::var("TOPK")
         .ok()
