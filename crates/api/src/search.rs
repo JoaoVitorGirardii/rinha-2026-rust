@@ -8,7 +8,7 @@ pub struct IvfIndex {
     pub k: usize,
     pub n: usize,
     pub nprobe_default: usize,
-    centroids: Vec<[f32; 14]>,
+    centroids: Vec<[f32; 16]>,
     cluster_offsets: Vec<u32>,
     cluster_sizes: Vec<u32>,
     labels: Vec<u8>,
@@ -42,12 +42,12 @@ impl IvfIndex {
 
         let mut offset = 64usize;
 
-        // Centroids: k * 14 * f32
+        // Centroids: k * 14 * f32 — padded to [f32; 16] para AVX2 (dims 14 e 15 = 0)
         let centroid_bytes = k * 14 * 4;
         let centroid_slice = &data[offset..offset + centroid_bytes];
-        let mut centroids: Vec<[f32; 14]> = Vec::with_capacity(k);
+        let mut centroids: Vec<[f32; 16]> = Vec::with_capacity(k);
         for i in 0..k {
-            let mut c = [0.0f32; 14];
+            let mut c = [0.0f32; 16];
             for j in 0..14 {
                 let b = &centroid_slice[(i * 14 + j) * 4..(i * 14 + j) * 4 + 4];
                 c[j] = f32::from_le_bytes(b.try_into().unwrap());
@@ -119,9 +119,7 @@ impl IvfIndex {
         // Treina branch predictor e caches SIMD com ~32 searches distribuídos pelos centroides
         let step = (self.k / 32).max(1);
         for centroid in self.centroids.iter().step_by(step) {
-            let mut q = [0.0f32; 16];
-            q[..14].copy_from_slice(centroid);
-            let _ = self.search(&q, nprobe, topk);
+            let _ = self.search(centroid, nprobe, topk);
         }
     }
 
@@ -138,13 +136,27 @@ impl IvfIndex {
 
     #[inline]
     fn search_inner<const N: usize>(&self, query: &[f32; 16], nprobe: usize) -> f32 {
-        // Passo 1: encontrar os nprobe centroides mais próximos (f32+L2)
+        // Detecta AVX2 uma vez — usada no centroid scan e no phase 1
+        #[cfg(target_arch = "x86_64")]
+        let use_avx2 = is_x86_feature_detected!("avx2");
+        #[cfg(not(target_arch = "x86_64"))]
+        let use_avx2 = false;
+
+        // Passo 1: encontrar os nprobe centroides mais próximos (f32+L2, AVX2+FMA)
         let mut centroid_dists = [(0.0f32, 0u32); 1024];
         let k = self.k.min(1024);
 
-        for i in 0..k {
-            let d = dist_sq_14d_f32(query, &self.centroids[i]);
-            centroid_dists[i] = (d, i as u32);
+        if use_avx2 {
+            #[cfg(target_arch = "x86_64")]
+            for i in 0..k {
+                let d = unsafe { dist_sq_16d_avx2(query, &self.centroids[i]) };
+                centroid_dists[i] = (d, i as u32);
+            }
+        } else {
+            for i in 0..k {
+                let d = dist_sq_16d_scalar(query, &self.centroids[i]);
+                centroid_dists[i] = (d, i as u32);
+            }
         }
 
         let nprobe = nprobe.min(k);
@@ -159,11 +171,6 @@ impl IvfIndex {
 
         // Passo 3: scan rápido uint8+Manhattan → mantém top-N candidatos
         let mut cands = TopKN::<N>::new();
-
-        #[cfg(target_arch = "x86_64")]
-        let use_avx2 = is_x86_feature_detected!("avx2");
-        #[cfg(not(target_arch = "x86_64"))]
-        let use_avx2 = false;
 
         for idx in 0..nprobe {
             let ci = centroid_dists[idx].1 as usize;
@@ -400,13 +407,30 @@ fn manhattan_u8_scalar(a: &[u8; 16], b: &[u8; 16]) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// Distância euclidiana ao quadrado — centroides (f32 × 14)
+// Distância euclidiana ao quadrado — centroides (f32 × 16, dims 14-15 = 0)
+// AVX2+FMA: 2 YMM loads + sub + mul + fmadd + hsum256 por centroide
 // ---------------------------------------------------------------------------
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn dist_sq_16d_avx2(a: &[f32; 16], b: &[f32; 16]) -> f32 {
+    use std::arch::x86_64::*;
+    let a0 = _mm256_loadu_ps(a.as_ptr());
+    let a1 = _mm256_loadu_ps(a.as_ptr().add(8));
+    let b0 = _mm256_loadu_ps(b.as_ptr());
+    let b1 = _mm256_loadu_ps(b.as_ptr().add(8));
+    let d0 = _mm256_sub_ps(a0, b0);
+    let d1 = _mm256_sub_ps(a1, b1);
+    let s0 = _mm256_mul_ps(d0, d0);
+    let sum8 = _mm256_fmadd_ps(d1, d1, s0);
+    hsum256(sum8)
+}
+
 #[inline(always)]
-fn dist_sq_14d_f32(a: &[f32; 16], b: &[f32; 14]) -> f32 {
+fn dist_sq_16d_scalar(a: &[f32; 16], b: &[f32; 16]) -> f32 {
     let mut sum = 0.0f32;
-    for i in 0..14 {
+    for i in 0..16 {
         let d = a[i] - b[i];
         sum += d * d;
     }
