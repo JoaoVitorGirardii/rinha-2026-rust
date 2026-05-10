@@ -1,6 +1,6 @@
 services:
   api1:
-    image: joaovitorgirardiii/rinha-2026-rust:test
+    image: joaovitorgirardiii/rinha-2026-rust:latest
     cpuset: "0"
     environment:
       PORT: "3000"
@@ -14,7 +14,7 @@ services:
           memory: "167MB"
 
   api2:
-    image: joaovitorgirardiii/rinha-2026-rust:test
+    image: joaovitorgirardiii/rinha-2026-rust:latest
     cpuset: "1"
     environment:
       PORT: "3000"
