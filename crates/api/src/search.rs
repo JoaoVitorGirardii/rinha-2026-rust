@@ -111,6 +111,20 @@ impl IvfIndex {
         })
     }
 
+    pub fn warmup(&self, nprobe: usize, topk: usize) {
+        // Resolve page faults tocando 1 byte por página (4KB) de ambos os buffers
+        let _t1: u64 = self.vectors_u8.chunks(4096).fold(0u64, |a, c| a + c[0] as u64);
+        let _t2: u64 = self.vectors.chunks(4096).fold(0u64, |a, c| a + c[0] as u64);
+
+        // Treina branch predictor e caches SIMD com ~32 searches distribuídos pelos centroides
+        let step = (self.k / 32).max(1);
+        for centroid in self.centroids.iter().step_by(step) {
+            let mut q = [0.0f32; 16];
+            q[..14].copy_from_slice(centroid);
+            let _ = self.search(&q, nprobe, topk);
+        }
+    }
+
     /// Retorna o fraud_score (0.0..=1.0) para o vetor query dado.
     /// query deve ser [f32; 16] com dims 14 e 15 = 0 (padding).
     #[inline]

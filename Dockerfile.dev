@@ -1,0 +1,43 @@
+# Build rápido para desenvolvimento — reutiliza o índice da imagem :test existente
+# Não roda o preprocess (k-means), só compila a API
+
+FROM joaovitorgirardiii/rinha-2026-rust:test AS index_source
+
+FROM rust:1.86-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+COPY Cargo.toml ./
+COPY crates/api/Cargo.toml ./crates/api/Cargo.toml
+COPY crates/preprocess/Cargo.toml ./crates/preprocess/Cargo.toml
+COPY .cargo/ ./.cargo/
+
+RUN mkdir -p crates/api/src crates/preprocess/src && \
+    echo 'fn main(){}' > crates/api/src/main.rs && \
+    echo 'fn main(){}' > crates/preprocess/src/main.rs && \
+    cargo build --release 2>/dev/null || true
+
+COPY crates/ ./crates/
+RUN touch crates/api/src/main.rs
+
+ENV RUSTFLAGS="-C target-cpu=haswell -C target-feature=+avx2,+f16c,+fma -C opt-level=3"
+RUN cargo build --release -p api
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends libgcc-s1 && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/api /app/api
+COPY --from=index_source /app/ivf_index.bin /app/ivf_index.bin
+
+ENV INDEX_PATH=/app/ivf_index.bin
+ENV PORT=3000
+ENV NPROBE=16
+
+EXPOSE 3000
+
+CMD ["/app/api"]

@@ -1,6 +1,7 @@
 services:
   api1:
-    image: joaovitorgirardiii/rinha-2026-rust:latest
+    image: joaovitorgirardiii/rinha-2026-rust:test
+    cpuset: "0"
     environment:
       PORT: "3000"
       INDEX_PATH: "/app/ivf_index.bin"
@@ -15,7 +16,8 @@ services:
           memory: "167MB"
 
   api2:
-    image: joaovitorgirardiii/rinha-2026-rust:latest
+    image: joaovitorgirardiii/rinha-2026-rust:test
+    cpuset: "1"
     environment:
       PORT: "3000"
       INDEX_PATH: "/app/ivf_index.bin"
@@ -31,6 +33,7 @@ services:
 
   haproxy:
     image: haproxy:2.8-alpine
+    cpuset: "2"
     volumes:
       - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     ports:

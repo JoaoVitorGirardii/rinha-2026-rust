@@ -52,10 +52,8 @@ async fn run() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(50usize);
 
-    let dummy = [0.5f32; 16];
-    let _ = index.search(&dummy, nprobe, topk);
-
-    eprintln!("topk={topk}");
+    index.warmup(nprobe, topk);
+    eprintln!("Warmup concluído — topk={topk}");
 
     let state: SharedState = Arc::new(AppState { index, nprobe, topk });
 

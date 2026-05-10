@@ -15,7 +15,7 @@ Client
   │
   ▼
 HAProxy :9999
-  │  leastconn, http-keep-alive
+  │  roundrobin, http-keep-alive
   ├──► api1 :3000 (0.45 CPU, 167 MB)
   └──► api2 :3000 (0.45 CPU, 167 MB)
 ```
@@ -31,22 +31,22 @@ de avaliação de fraude.
 
 Cada transação é convertida em um **vetor de 14 dimensões** por `vectorize.rs`:
 
-| dim | feature | normalização |
-|-----|---------|-------------|
-| 0 | `amount` | `/ 10000.0`, clip [0,1] |
-| 1 | `installments` | `/ 12.0`, clip [0,1] |
-| 2 | `amount / customer.avg_amount` | `/ 10.0`, clip [0,1] |
-| 3 | hora do dia (UTC) | `/ 23.0` |
-| 4 | dia da semana (Mon=0) | `/ 6.0` |
-| 5 | minutos desde última transação | `/ 1440.0` ou -1 se ausente |
-| 6 | km da última transação até a atual | `/ 1000.0` ou -1 se ausente |
-| 7 | `terminal.km_from_home` | `/ 1000.0` |
-| 8 | `customer.tx_count_24h` | `/ 20.0`, clip [0,1] |
-| 9 | `terminal.is_online` | 0 ou 1 |
-| 10 | `terminal.card_present` | 0 ou 1 |
-| 11 | comerciante desconhecido | 0 (conhecido) ou 1 (desconhecido) |
-| 12 | risco do MCC | valor pré-definido por categoria |
-| 13 | `merchant.avg_amount` | `/ 10000.0`, clip [0,1] |
+| dim | feature                            | normalização                      |
+| --- | ---------------------------------- | --------------------------------- |
+| 0   | `amount`                           | `/ 10000.0`, clip [0,1]           |
+| 1   | `installments`                     | `/ 12.0`, clip [0,1]              |
+| 2   | `amount / customer.avg_amount`     | `/ 10.0`, clip [0,1]              |
+| 3   | hora do dia (UTC)                  | `/ 23.0`                          |
+| 4   | dia da semana (Mon=0)              | `/ 6.0`                           |
+| 5   | minutos desde última transação     | `/ 1440.0` ou -1 se ausente       |
+| 6   | km da última transação até a atual | `/ 1000.0` ou -1 se ausente       |
+| 7   | `terminal.km_from_home`            | `/ 1000.0`                        |
+| 8   | `customer.tx_count_24h`            | `/ 20.0`, clip [0,1]              |
+| 9   | `terminal.is_online`               | 0 ou 1                            |
+| 10  | `terminal.card_present`            | 0 ou 1                            |
+| 11  | comerciante desconhecido           | 0 (conhecido) ou 1 (desconhecido) |
+| 12  | risco do MCC                       | valor pré-definido por categoria  |
+| 13  | `merchant.avg_amount`              | `/ 10000.0`, clip [0,1]           |
 
 Campos ausentes (`last_transaction`) usam sentinela `-1.0`.
 
@@ -62,6 +62,7 @@ Construído em tempo de build por `crates/preprocess`:
 - **Validação de recall**: 1000 amostras aleatórias verificam recall ≥ 99% antes de escrever o índice
 
 Formato binário (`ivf_index.bin`, ~94 MB):
+
 ```
 [header 64B] [centroids: K×14×f32] [offsets: K×u32] [sizes: K×u32]
              [labels: N×u8] [vectors: N×16×f16]
@@ -76,12 +77,14 @@ Os vetores são padded de 14 para 16 dimensões para alinhamento SIMD.
 #### Phase 1: scan rápido uint8 + Manhattan SSE2/AVX2
 
 Ao carregar o índice, os vetores f16 são quantizados para uint8:
+
 ```
 q_u8 = round((v + 1.0) × 127.5)  →  [-1,1] → [0,255]
 ```
 
 A query também é quantizada. O scan usa `_mm_sad_epu8` (SSE2) — soma de diferenças
 absolutas de 16 bytes em **1 instrução**:
+
 ```
 SAD = Σ|query_u8[i] - ref_u8[i]|  para i in 0..16
 ```
@@ -95,6 +98,7 @@ Resulta em um heap **TopK50** com os 50 candidatos de menor distância Manhattan
 
 Os 50 candidatos são re-rankeados com a distância euclidiana exata sobre os vetores f16
 usando instruções AVX2 + F16C:
+
 ```rust
 _mm256_cvtph_ps  →  converte 8 f16 para f32 em 1 instrução
 _mm256_sub_ps    →  subtrai
@@ -134,6 +138,7 @@ misses de L3). A 450 req/s de pico:
 ```
 
 Com nprobe=4 (~0.4ms de CPU por request):
+
 ```
 450 req/s × 0.4ms/req = 180ms/s = 40% do quota → sem throttling → p99 = 1.91ms
 ```
@@ -153,6 +158,7 @@ tokio::runtime::Builder::new_multi_thread()
 ```
 
 O KNN é executado em `spawn_blocking` para não bloquear o executor async:
+
 ```rust
 let fraud_score = tokio::task::spawn_blocking(move || {
     state.index.search(&query, state.nprobe)
@@ -180,11 +186,11 @@ curl -s http://localhost:9999/ready   # → 200 OK
 
 ## Resultados por configuração
 
-| nprobe | p99 | FP | FN | E | score |
-|--------|-----|----|----|---|-------|
-| 16 | 58ms | 2 | 3 | 11 | 3928 |
-| 8 | 14ms | 3 | 3 | 12 | 4520 |
-| **4** | **1.91ms** | **6** | **12** | **42** | **5228** |
+| nprobe | p99        | FP    | FN     | E      | score    |
+| ------ | ---------- | ----- | ------ | ------ | -------- |
+| 16     | 58ms       | 2     | 3      | 11     | 3928     |
+| 8      | 14ms       | 3     | 3      | 12     | 4520     |
+| **4**  | **1.91ms** | **6** | **12** | **42** | **5228** |
 
 ---
 
