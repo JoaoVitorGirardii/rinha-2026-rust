@@ -36,7 +36,7 @@ impl Forest {
     pub fn load(path: &str) -> Result<Self> {
         let data = fs::read_to_string(path)
             .with_context(|| format!("lendo modelo: {path}"))?;
-        let raw: RawModel = serde_json::from_str(&data)
+        let raw: RawModel = sonic_rs::from_str(&data)
             .context("parseando model-tree.json")?;
 
         let total_nodes: usize = raw.trees.iter().map(|t| t.n_nodes).sum();

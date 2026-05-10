@@ -114,7 +114,16 @@ impl IvfIndex {
     /// Retorna o fraud_score (0.0..=1.0) para o vetor query dado.
     /// query deve ser [f32; 16] com dims 14 e 15 = 0 (padding).
     #[inline]
-    pub fn search(&self, query: &[f32; 16], nprobe: usize) -> f32 {
+    pub fn search(&self, query: &[f32; 16], nprobe: usize, topk: usize) -> f32 {
+        match topk {
+            40 => self.search_inner::<40>(query, nprobe),
+            60 => self.search_inner::<60>(query, nprobe),
+            _  => self.search_inner::<50>(query, nprobe),
+        }
+    }
+
+    #[inline]
+    fn search_inner<const N: usize>(&self, query: &[f32; 16], nprobe: usize) -> f32 {
         // Passo 1: encontrar os nprobe centroides mais próximos (f32+L2)
         let mut centroid_dists = [(0.0f32, 0u32); 1024];
         let k = self.k.min(1024);
@@ -134,10 +143,8 @@ impl IvfIndex {
             ((query[i] + 1.0) * 127.5).clamp(0.0, 255.0).round() as u8
         });
 
-        // Passo 3: scan rápido uint8+Manhattan → mantém top-50 candidatos
-        // Top-50 fornece buffer suficiente para que o re-ranking f16+L2
-        // encontre os mesmos top-5 que encontraria varrendo todos os vetores.
-        let mut cands = TopK50::new();
+        // Passo 3: scan rápido uint8+Manhattan → mantém top-N candidatos
+        let mut cands = TopKN::<N>::new();
 
         #[cfg(target_arch = "x86_64")]
         let use_avx2 = is_x86_feature_detected!("avx2");
@@ -183,7 +190,7 @@ impl IvfIndex {
             }
         }
 
-        // Passo 4: re-ranking exato com f16+L2 sobre os top-50 candidatos
+        // Passo 4: re-ranking exato com f16+L2 sobre os top-N candidatos
         let mut topk = TopK5::new();
         let count = cands.count;
 
@@ -202,25 +209,24 @@ impl IvfIndex {
 }
 
 // ---------------------------------------------------------------------------
-// TopK50: mantém os 50 menores índices por distância uint8+Manhattan
+// TopKN<N>: mantém os N menores índices por distância uint8+Manhattan
 // Usado para selecionar candidatos para re-ranking exato.
-// Buffer maior reduz FP/FN em edge cases onde top-5 f16+L2 não coincide com top-30 u8.
 // ---------------------------------------------------------------------------
 
-struct TopK50 {
-    dists: [u32; 50],
-    indices: [u32; 50],
+struct TopKN<const N: usize> {
+    dists: [u32; N],
+    indices: [u32; N],
     max_dist: u32,
     max_idx: usize,
     count: usize,
 }
 
-impl TopK50 {
+impl<const N: usize> TopKN<N> {
     #[inline(always)]
     fn new() -> Self {
         Self {
-            dists: [u32::MAX; 50],
-            indices: [0u32; 50],
+            dists: [u32::MAX; N],
+            indices: [0u32; N],
             max_dist: u32::MAX,
             max_idx: 0,
             count: 0,
@@ -229,7 +235,7 @@ impl TopK50 {
 
     #[inline(always)]
     fn push(&mut self, dist: u32, global_idx: u32) {
-        if self.count < 50 {
+        if self.count < N {
             let i = self.count;
             self.dists[i] = dist;
             self.indices[i] = global_idx;
@@ -238,10 +244,9 @@ impl TopK50 {
                 self.max_dist = dist;
                 self.max_idx = i;
             }
-            // Recalcula max quando o array enche
-            if self.count == 50 {
+            if self.count == N {
                 self.max_dist = u32::MIN;
-                for j in 0..50 {
+                for j in 0..N {
                     if self.dists[j] > self.max_dist {
                         self.max_dist = self.dists[j];
                         self.max_idx = j;
@@ -253,7 +258,7 @@ impl TopK50 {
             self.dists[idx] = dist;
             self.indices[idx] = global_idx;
             self.max_dist = u32::MIN;
-            for j in 0..50 {
+            for j in 0..N {
                 if self.dists[j] > self.max_dist {
                     self.max_dist = self.dists[j];
                     self.max_idx = j;

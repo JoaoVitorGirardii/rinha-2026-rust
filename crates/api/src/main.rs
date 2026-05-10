@@ -6,18 +6,19 @@ use std::sync::Arc;
 
 use axum::{
     Router,
+    body::Bytes,
     extract::State,
-    http::StatusCode,
+    http::{StatusCode, header},
     response::IntoResponse,
     routing::{get, post},
-    Json,
 };
-use models::{FraudRequest, FraudResponse};
+use models::FraudRequest;
 use search::IvfIndex;
 
 struct AppState {
     index: IvfIndex,
     nprobe: usize,
+    topk: usize,
 }
 
 type SharedState = Arc<AppState>;
@@ -46,10 +47,17 @@ async fn run() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(index.nprobe_default);
 
-    let dummy = [0.5f32; 16];
-    let _ = index.search(&dummy, nprobe);
+    let topk = std::env::var("TOPK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50usize);
 
-    let state: SharedState = Arc::new(AppState { index, nprobe });
+    let dummy = [0.5f32; 16];
+    let _ = index.search(&dummy, nprobe, topk);
+
+    eprintln!("topk={topk}");
+
+    let state: SharedState = Arc::new(AppState { index, nprobe, topk });
 
     let app = Router::new()
         .route("/fraud-score", post(fraud_score_handler))
@@ -80,20 +88,29 @@ async fn ready_handler() -> impl IntoResponse {
     StatusCode::OK
 }
 
+// K=5 vizinhos → fraud_score ∈ {0.0, 0.2, 0.4, 0.6, 0.8, 1.0} — 6 valores fixos
+static RESPONSES: [&[u8]; 6] = [
+    b"{\"approved\":true,\"fraud_score\":0.0}",
+    b"{\"approved\":true,\"fraud_score\":0.2}",
+    b"{\"approved\":true,\"fraud_score\":0.4}",
+    b"{\"approved\":false,\"fraud_score\":0.6}",
+    b"{\"approved\":false,\"fraud_score\":0.8}",
+    b"{\"approved\":false,\"fraud_score\":1.0}",
+];
+
 async fn fraud_score_handler(
     State(state): State<SharedState>,
-    Json(req): Json<FraudRequest>,
+    body: Bytes,
 ) -> impl IntoResponse {
+    let req: FraudRequest = sonic_rs::from_slice(&body).unwrap();
     let query = vectorize::vectorize(&req);
 
     let fraud_score = tokio::task::spawn_blocking(move || {
-        state.index.search(&query, state.nprobe)
+        state.index.search(&query, state.nprobe, state.topk)
     })
     .await
     .unwrap();
 
-    Json(FraudResponse {
-        approved: fraud_score < 0.6,
-        fraud_score,
-    })
+    let idx = (fraud_score * 5.0).round() as usize;
+    ([(header::CONTENT_TYPE, "application/json")], RESPONSES[idx])
 }
