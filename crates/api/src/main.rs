@@ -23,8 +23,7 @@ type SharedState = Arc<AppState>;
 
 fn main() -> anyhow::Result<()> {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .max_blocking_threads(4)
+        .worker_threads(1)
         .enable_all()
         .build()?
         .block_on(run())
@@ -99,13 +98,7 @@ async fn fraud_score_handler(
     body: Bytes,
 ) -> impl IntoResponse {
     let query = vectorize::vectorize_raw(&body);
-
-    let fraud_score = tokio::task::spawn_blocking(move || {
-        state.index.search(&query, state.nprobe, state.topk)
-    })
-    .await
-    .unwrap();
-
+    let fraud_score = state.index.search(&query, state.nprobe, state.topk);
     let idx = (fraud_score * 5.0).round() as usize;
     ([(header::CONTENT_TYPE, "application/json")], RESPONSES[idx])
 }
