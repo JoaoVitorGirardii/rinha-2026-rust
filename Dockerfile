@@ -64,7 +64,6 @@ COPY --from=preprocessor /app/ivf_index.bin /app/ivf_index.bin
 
 ENV INDEX_PATH=/app/ivf_index.bin
 ENV PORT=3000
-ENV NPROBE=16
 
 EXPOSE 3000
 

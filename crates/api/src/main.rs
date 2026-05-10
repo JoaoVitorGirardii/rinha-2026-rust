@@ -1,4 +1,3 @@
-mod models;
 mod search;
 mod vectorize;
 
@@ -12,7 +11,6 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use models::FraudRequest;
 use search::IvfIndex;
 
 struct AppState {
@@ -45,12 +43,12 @@ async fn run() -> anyhow::Result<()> {
     let nprobe = std::env::var("NPROBE")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(index.nprobe_default);
+        .unwrap_or(7usize);
 
     let topk = std::env::var("TOPK")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(50usize);
+        .unwrap_or(60usize);
 
     index.warmup(nprobe, topk);
     eprintln!("Warmup concluído — topk={topk}");
@@ -100,8 +98,7 @@ async fn fraud_score_handler(
     State(state): State<SharedState>,
     body: Bytes,
 ) -> impl IntoResponse {
-    let req: FraudRequest = sonic_rs::from_slice(&body).unwrap();
-    let query = vectorize::vectorize(&req);
+    let query = vectorize::vectorize_raw(&body);
 
     let fraud_score = tokio::task::spawn_blocking(move || {
         state.index.search(&query, state.nprobe, state.topk)
