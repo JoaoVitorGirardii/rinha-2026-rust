@@ -4,7 +4,8 @@ services:
     environment:
       PORT: "3000"
       INDEX_PATH: "/app/ivf_index.bin"
-      NPROBE: "4"
+      NPROBE: "6"
+      TOPK: "60"
     networks:
       - rinha
     deploy:
@@ -18,7 +19,8 @@ services:
     environment:
       PORT: "3000"
       INDEX_PATH: "/app/ivf_index.bin"
-      NPROBE: "4"
+      NPROBE: "6"
+      TOPK: "60"
     networks:
       - rinha
     deploy:
